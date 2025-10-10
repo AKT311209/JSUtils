@@ -1,0 +1,384 @@
+(function () {
+  // This script is an enhanced version of your extractor.
+  // It auto-scrolls, captures per-article facebook links (first + tags),
+  // and when you signal stop with: window.postMessage('stop', '*');
+  // it aggregates results by commenter (Name+Profile Link) and produces a CSV
+  // with columns: Name, Link, Comments Count, Tags Count
+  // Rows with Comments Count === 0 are skipped.
+
+  // --- helpers (normalize + name extraction + posts-check) ---
+  function normalizeFacebookHref(href) {
+    try {
+      const url = new URL(href, document.location.origin);
+      const pathname = url.pathname || '';
+      const origin = url.origin || `${location.protocol}//${location.host}`;
+      const normalizedPath = pathname.endsWith('/') && pathname !== '/' ? pathname.slice(0, -1) : pathname;
+
+      if (normalizedPath.endsWith('/profile.php') || normalizedPath === '/profile.php') {
+        const id = url.searchParams.get('id');
+        if (id) {
+          return `${origin}${normalizedPath}?id=${encodeURIComponent(id)}`;
+        }
+      }
+
+      return `${origin}${normalizedPath}`;
+    } catch (e) {
+      try {
+        const raw = String(href);
+        if (raw.includes('profile.php') && raw.includes('id=')) {
+          return raw.split('&')[0];
+        }
+        return raw.split('?')[0];
+      } catch (err) {
+        return href;
+      }
+    }
+  }
+
+  function isPostsLink(href) {
+    try {
+      const url = new URL(href, document.location.origin);
+      return url.pathname && url.pathname.includes('/posts');
+    } catch (e) {
+      try {
+        return String(href).includes('/posts');
+      } catch (err) {
+        return false;
+      }
+    }
+  }
+
+  function extractNameFromAnchor(a) {
+    if (!a) return null;
+
+    try {
+      const walker = document.createTreeWalker(a, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+          const text = node.nodeValue ? node.nodeValue.trim() : '';
+          if (!text) return NodeFilter.FILTER_REJECT;
+
+          let p = node.parentNode;
+          while (p && p !== a) {
+            const nodeName = p.nodeName && p.nodeName.toUpperCase();
+            if (nodeName === 'IMG' || nodeName === 'SVG') return NodeFilter.FILTER_REJECT;
+            try {
+              if (p.getAttribute && p.getAttribute('role') === 'img') return NodeFilter.FILTER_REJECT;
+            } catch (e) {}
+            p = p.parentNode;
+          }
+
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      }, false);
+
+      const textNode = walker.nextNode();
+      if (textNode) {
+        const candidate = textNode.nodeValue.trim();
+        if (candidate && !/profile\s*picture/i.test(candidate)) {
+          return candidate;
+        }
+      }
+    } catch (e) {}
+
+    try {
+      const candidates = Array.from(a.querySelectorAll('span, div, strong, b, em, p'));
+      for (const c of candidates) {
+        const txt = c.textContent ? c.textContent.trim() : '';
+        if (txt && !/profile\s*picture/i.test(txt)) {
+          return txt;
+        }
+      }
+    } catch (e) {}
+
+    try {
+      const aria = a.getAttribute && a.getAttribute('aria-label');
+      if (aria && aria.trim() && !/profile\s*picture/i.test(aria)) {
+        return aria.trim();
+      }
+    } catch (e) {}
+
+    try {
+      const title = a.getAttribute && a.getAttribute('title');
+      if (title && title.trim() && !/profile\s*picture/i.test(title)) {
+        return title.trim();
+      }
+    } catch (e) {}
+
+    return null;
+  }
+
+  // find scrollable element
+  function isScrollable(element) {
+    const style = window.getComputedStyle(element);
+    const overflowY = style.overflowY;
+    const overflowX = style.overflowX;
+    const isOverflowScrollable = (overflowY === 'scroll' || overflowY === 'auto') ||
+                                 (overflowX === 'scroll' || overflowX === 'auto');
+
+    return isOverflowScrollable &&
+           (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth);
+  }
+
+  const allElements = document.querySelectorAll('*');
+  const scrollableElements = Array.from(allElements).filter(isScrollable);
+
+  if (scrollableElements.length === 0) {
+    console.log('No scrollable elements found on the page.');
+    return;
+  }
+
+  const lastScrollableElement = scrollableElements[scrollableElements.length - 1];
+
+  // dialog + articles scoping and per-article extraction
+  function findScopedArticles() {
+    const dialog = Array.from(document.querySelectorAll('div[role="dialog"]'))
+      .find(d => d.querySelector('div[role="article"][tabindex="-1"]') !== null);
+
+    if (dialog) {
+      return {
+        container: dialog,
+        articles: Array.from(dialog.querySelectorAll('div[role="article"][tabindex="-1"]'))
+      };
+    }
+
+    // fallback to document-wide
+    return {
+      container: document,
+      articles: Array.from(document.querySelectorAll('div[role="article"][tabindex="-1"]'))
+    };
+  }
+
+  // collect links from articles (first + tag anchors), excluding /posts links
+  function getLinksFromArticles() {
+    const { container, articles } = findScopedArticles();
+    const collected = [];
+
+    articles.forEach((article, idx) => {
+      const perArticleSeen = new Set();
+
+      // 1) Prefer first facebook link inside the article; otherwise first anchor
+      let firstAnchor = article.querySelector('a[href*="facebook.com"]') || article.querySelector('a[href]');
+      let normalizedFirst = null;
+      if (firstAnchor) {
+        try {
+          if (!isPostsLink(firstAnchor.href)) {
+            normalizedFirst = normalizeFacebookHref(firstAnchor.href);
+            if (!String(normalizedFirst).includes('/posts')) {
+              const name = extractNameFromAnchor(firstAnchor) || 'Unnamed';
+              collected.push({
+                articleIndex: idx,
+                role: 'first',
+                raw: firstAnchor.href,
+                link: normalizedFirst,
+                name
+              });
+              perArticleSeen.add(normalizedFirst);
+            }
+          }
+        } catch (e) {
+          if (!isPostsLink(firstAnchor.href)) {
+            const rawKey = String(firstAnchor.href);
+            if (!perArticleSeen.has(rawKey)) {
+              collected.push({
+                articleIndex: idx,
+                role: 'first',
+                raw: firstAnchor.href,
+                link: rawKey,
+                name: extractNameFromAnchor(firstAnchor) || 'Unnamed'
+              });
+              perArticleSeen.add(rawKey);
+            }
+          }
+        }
+      }
+
+      // 2) gather all tagging links (facebook links) inside the article
+      const tagAnchors = Array.from(article.querySelectorAll('a[href*="facebook.com"]'));
+      for (const a of tagAnchors) {
+        try {
+          if (isPostsLink(a.href)) continue;
+
+          const norm = normalizeFacebookHref(a.href);
+
+          if (normalizedFirst && norm === normalizedFirst) continue;
+          if (perArticleSeen.has(norm)) continue;
+
+          collected.push({
+            articleIndex: idx,
+            role: 'tag',
+            raw: a.href,
+            link: norm,
+            name: extractNameFromAnchor(a) || 'Unnamed'
+          });
+          perArticleSeen.add(norm);
+        } catch (e) {
+          const rawKey = String(a.href);
+          if (isPostsLink(rawKey)) continue;
+          if (normalizedFirst && rawKey === normalizedFirst) continue;
+          if (perArticleSeen.has(rawKey)) continue;
+
+          collected.push({
+            articleIndex: idx,
+            role: 'tag',
+            raw: a.href,
+            link: rawKey,
+            name: extractNameFromAnchor(a) || 'Unnamed'
+          });
+          perArticleSeen.add(rawKey);
+        }
+      }
+    });
+
+    return collected;
+  }
+
+  // auto-scroll + snapshot per run
+  let facebookLinks = [];
+  let userRequestedStop = false;
+
+  window.addEventListener('message', (event) => {
+    if (event.data === 'stop') {
+      userRequestedStop = true;
+    }
+  });
+
+  function autoScrollAndCapture(element) {
+    const interval = setInterval(() => {
+      if (userRequestedStop) {
+        clearInterval(interval);
+        console.log('User signaled to stop.');
+        console.log('Finalizing and logging captured links... please wait...');
+        populateNamesAndProduceCSV(facebookLinks);
+        return;
+      }
+
+      try {
+        element.scrollBy(0, 1000);
+      } catch (e) {
+        try {
+          element.scrollTop = element.scrollTop + 1000;
+        } catch (err) {}
+      }
+
+      const current = getLinksFromArticles();
+
+      // Replace stored links with the current snapshot so each run starts fresh.
+      facebookLinks = current;
+
+      console.log(`Captured Facebook links : ${facebookLinks.length}`);
+    }, 300);
+  }
+
+  // When stopping, try to populate missing names by scanning anchors, then aggregate and produce CSV
+  function populateNamesAndProduceCSV(data) {
+    // Try to populate any missing names by searching page anchors
+    data.forEach(item => {
+      if (item.name && item.name !== 'Unnamed') return;
+
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      for (const a of anchors) {
+        try {
+          const candidateNorm = normalizeFacebookHref(a.href);
+          if (candidateNorm === item.link || (item.raw && a.href.includes(item.raw)) || a.href.includes(item.link)) {
+            if (isPostsLink(a.href)) continue;
+            const n = extractNameFromAnchor(a);
+            if (n) {
+              item.name = n;
+              break;
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      if (!item.name) item.name = 'Unnamed';
+    });
+
+    // Aggregate:
+    // - For each articleIndex, find the 'first' (author) if present.
+    // - For that first, increment comments count.
+    // - Add the number of tag entries in that same article to that author's tags count.
+    const byArticle = new Map(); // articleIndex -> { first: entry or null, tags: [entries] }
+    for (const entry of data) {
+      const idx = entry.articleIndex;
+      if (!byArticle.has(idx)) byArticle.set(idx, { first: null, tags: [] });
+      const bucket = byArticle.get(idx);
+      if (entry.role === 'first') bucket.first = entry;
+      else if (entry.role === 'tag') bucket.tags.push(entry);
+    }
+
+    const persons = new Map(); // link -> { name, link, comments, tags }
+    function ensurePerson(link, name) {
+      if (!persons.has(link)) {
+        persons.set(link, { name: name || 'Unnamed', link, comments: 0, tags: 0 });
+      } else if ((!persons.get(link).name || persons.get(link).name === 'Unnamed') && name) {
+        persons.get(link).name = name;
+      }
+      return persons.get(link);
+    }
+
+    // For each article, attribute counts to the article's author (first)
+    for (const [articleIndex, bucket] of byArticle.entries()) {
+      const author = bucket.first;
+      if (!author) continue; // skip articles where we couldn't determine the commenter
+      const p = ensurePerson(author.link, author.name);
+      p.comments += 1;
+      p.tags += bucket.tags.length;
+    }
+
+    // Additionally, include any persons that appeared only as tags (so they show up with 0 comments)
+    for (const entry of data) {
+      if (!persons.has(entry.link)) {
+        ensurePerson(entry.link, entry.name);
+      }
+    }
+
+    // Build CSV rows: Name, Link, Comments Count, Tags Count
+    const rows = [];
+    // header
+    rows.push(['Name', 'Link', 'Comments Count', 'Tags Count']);
+
+    // Only include persons with comments > 0
+    for (const [link, info] of persons.entries()) {
+      if (!info || !info.comments || info.comments === 0) continue; // skip rows where Comments Count === 0
+      rows.push([info.name, info.link, String(info.comments), String(info.tags)]);
+    }
+
+    const csv = rows.map(r => r.map(cell => {
+      if (cell == null) return '';
+      const s = String(cell);
+      // escape double quotes
+      const escaped = s.replace(/"/g, '""');
+      // wrap in quotes if contains comma, quote or newline
+      if (/,|"|\n/.test(s)) return `"${escaped}"`;
+      return s;
+    }).join(',')).join('\r\n') + '\r\n'; // Use CRLF for cross-platform compatibility and ensure final newline
+
+    // Log the filtered aggregated persons and CSV
+    const filteredPersons = Array.from(persons.values()).filter(p => p.comments && p.comments > 0);
+
+    // Trigger download
+    try {
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'facebook_commenters_aggregation.csv';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        try { a.remove(); } catch (e) {}
+      }, 5000);
+      console.log('CSV download should have started (facebook_commenters_aggregation.csv).');
+    } catch (e) {
+      console.warn('Could not trigger download automatically. Here is the CSV string to copy:');
+      console.log(csv);
+    }
+  }
+
+  // start
+  autoScrollAndCapture(lastScrollableElement);
+  console.log("Started auto-scrolling. To stop and produce CSV run: window.postMessage('stop', '*');");
+})();

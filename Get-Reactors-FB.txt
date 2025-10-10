@@ -1,0 +1,352 @@
+// Script to auto-scroll a dialog on Facebook, capture facebook links, and generate CSV.
+// Special handling: if the link is in the format
+//   https://www.facebook.com/profile.php?id=100055134276216&....
+// then we keep the `?id=...` part but drop the first `&` and everything after it.
+// For other facebook links we keep only the origin+pathname (drop entire query string).
+//
+// Usage: Paste into the page console. To stop the scrolling and trigger CSV generation:
+//   window.postMessage('stop', '*');
+
+(function () {
+  function isScrollable(element) {
+    const style = window.getComputedStyle(element);
+    const overflowY = style.overflowY;
+    const overflowX = style.overflowX;
+    const isOverflowScrollable = (overflowY === 'scroll' || overflowY === 'auto') ||
+                                 (overflowX === 'scroll' || overflowX === 'auto');
+
+    return isOverflowScrollable &&
+           (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth);
+  }
+
+  const allElements = document.querySelectorAll('*');
+  const scrollableElements = Array.from(allElements).filter(isScrollable);
+
+  if (scrollableElements.length === 0) {
+    console.log('No scrollable elements found on the page.');
+    return;
+  }
+
+  const lastScrollableElement = scrollableElements[scrollableElements.length - 1];
+
+  let facebookLinks = [];
+  let userRequestedStop = false;
+
+  // Listen for the "stop" signal from the user
+  window.addEventListener('message', (event) => {
+    if (event.data === 'stop') {
+      userRequestedStop = true;
+    }
+  });
+
+  // Normalize Facebook link according to the rule:
+  // - If pathname ends with 'profile.php' and there's an 'id' search param, keep only "?id=..."
+  // - Otherwise keep only origin + pathname (drop whole query)
+  function normalizeFacebookHref(href) {
+    try {
+      // Some links could be relative; supply document.location.origin as base.
+      const url = new URL(href, document.location.origin);
+      const pathname = url.pathname || '';
+      const origin = url.origin || `${location.protocol}//${location.host}`;
+
+      // Normalize trailing slashes consistently (remove trailing slash except root)
+      const normalizedPath = pathname.endsWith('/') && pathname !== '/' ? pathname.slice(0, -1) : pathname;
+
+      if (normalizedPath.endsWith('/profile.php') || normalizedPath === '/profile.php') {
+        const id = url.searchParams.get('id');
+        if (id) {
+          // Keep only origin + /profile.php + ?id=...
+          return `${origin}${normalizedPath}?id=${encodeURIComponent(id)}`;
+        }
+      }
+
+      // For other facebook links keep origin + pathname (no query)
+      return `${origin}${normalizedPath}`;
+    } catch (e) {
+      // If URL parsing fails, fallback to a safer string trim approach:
+      // - If it contains 'profile.php' and an 'id=' substring, keep up to first '&' (if any)
+      // - Otherwise, remove everything starting with '?'
+      try {
+        const raw = String(href);
+        if (raw.includes('profile.php') && raw.includes('id=')) {
+          const upToAmp = raw.split('&')[0];
+          return upToAmp;
+        }
+        return raw.split('?')[0];
+      } catch (err) {
+        return href;
+      }
+    }
+  }
+
+  // Heuristic to extract a meaningful name from an <a> element while avoiding profile picture text/alt.
+  // This version explicitly skips suggestions containing Vietnamese words "ảnh" and "hình"
+  // and English words "image" and "picture" (as well as other photo/avatar phrases).
+  function extractNameFromAnchor(a) {
+    if (!a) return null;
+
+    // Helper: visible check for elements and nodes
+    function isVisible(el) {
+      try {
+        if (!el) return false;
+        const target = el.nodeType === Node.TEXT_NODE ? el.parentElement : el;
+        if (!target) return false;
+        const rects = target.getClientRects();
+        if (!rects || rects.length === 0) return false;
+        const style = window.getComputedStyle(target);
+        if (!style) return false;
+        if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) return false;
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    // Blacklist strings that indicate photos/avatars (include Vietnamese "ảnh", "hình" and English "image", "picture")
+    const photoRegex = /profile\s*picture|profile\s*photo|profilepic|profile-pic|avatar|photo\s*of|image|picture|ảnh|hình|foto\s*de\s*perfil|profilbild/i;
+
+    // Quick early check: if anchor is image-only (contains img/svg and no visible textual sibling),
+    // avoid using image alt text; rely on aria/title only as potential fallback.
+    try {
+      const imgs = a.querySelectorAll('img, svg');
+      if (imgs.length > 0) {
+        let hasVisibleTextSibling = false;
+        for (const node of a.childNodes) {
+          if (node.nodeType === Node.TEXT_NODE) {
+            const txt = node.nodeValue ? node.nodeValue.trim() : '';
+            if (txt && !photoRegex.test(txt) && isVisible(node)) {
+              hasVisibleTextSibling = true;
+              break;
+            }
+          } else if (node.nodeType === Node.ELEMENT_NODE) {
+            const nodeName = node.nodeName && node.nodeName.toUpperCase();
+            if (nodeName !== 'IMG' && nodeName !== 'SVG') {
+              const txt = node.textContent ? node.textContent.trim() : '';
+              if (txt && !photoRegex.test(txt) && isVisible(node)) {
+                hasVisibleTextSibling = true;
+                break;
+              }
+            }
+          }
+        }
+        if (!hasVisibleTextSibling) {
+          // intentionally do not extract from image-only anchors' alt text here
+        }
+      }
+    } catch (e) {
+      // ignore and continue
+    }
+
+    // 1) Walk text nodes inside the anchor but skip any text that is within IMG/SVG or elements with role="img".
+    try {
+      const walker = document.createTreeWalker(a, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+          const text = node.nodeValue ? node.nodeValue.trim() : '';
+          if (!text) return NodeFilter.FILTER_REJECT;
+
+          // Reject text nodes that are descendants of IMG, SVG or elements that have role="img"
+          let p = node.parentNode;
+          while (p && p !== a) {
+            const nodeName = p.nodeName && p.nodeName.toUpperCase();
+            if (nodeName === 'IMG' || nodeName === 'SVG') return NodeFilter.FILTER_REJECT;
+            try {
+              if (p.getAttribute && p.getAttribute('role') === 'img') return NodeFilter.FILTER_REJECT;
+            } catch (e) {
+              // ignore
+            }
+            p = p.parentNode;
+          }
+
+          // Reject if text looks like a photo label (includes "ảnh", "hình", "image", "picture", etc.)
+          if (photoRegex.test(text)) return NodeFilter.FILTER_REJECT;
+
+          // Require the text node's parent to be visible
+          const parentEl = node.parentElement || a;
+          if (!isVisible(parentEl)) return NodeFilter.FILTER_REJECT;
+
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      }, false);
+
+      let textNode = walker.nextNode();
+      while (textNode) {
+        const candidate = textNode.nodeValue.trim();
+        if (candidate && candidate.length >= 2 && candidate.length <= 80) {
+          // Heuristic: prefer entries that contain letters (reduce picking timestamps or counters)
+          if (/[A-Za-z\u00C0-\u024F\u0100-\u017F\u0400-\u04FF]/.test(candidate)) {
+            return candidate;
+          }
+        }
+        textNode = walker.nextNode();
+      }
+    } catch (e) {
+      // If TreeWalker fails, fall back to simple approach below
+    }
+
+    // 2) Try to find visible textual elements (span/div etc.) inside the anchor that are not images
+    try {
+      const candidates = Array.from(a.querySelectorAll('span, div, strong, b, em, p, h1, h2, h3'));
+      // Prefer larger/longer text elements first
+      candidates.sort((x, y) => (y.textContent || '').length - (x.textContent || '').length);
+      for (const c of candidates) {
+        const txt = c.textContent ? c.textContent.trim() : '';
+        if (!txt) continue;
+        if (photoRegex.test(txt)) continue;
+        if (!isVisible(c)) continue;
+        if (txt.length >= 2 && txt.length <= 80 && /[A-Za-z\u00C0-\u024F\u0100-\u017F\u0400-\u04FF]/.test(txt)) {
+          return txt;
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // 3) aria-label (but skip if it equals or contains photo-related words)
+    try {
+      const aria = a.getAttribute && a.getAttribute('aria-label');
+      if (aria && aria.trim() && !photoRegex.test(aria) && /[A-Za-z\u00C0-\u024F\u0100-\u017F\u0400-\u04FF]/.test(aria)) {
+        return aria.trim();
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // 4) title attribute (same check)
+    try {
+      const title = a.getAttribute && a.getAttribute('title');
+      if (title && title.trim() && !photoRegex.test(title) && /[A-Za-z\u00C0-\u024F\u0100-\u017F\u0400-\u04FF]/.test(title)) {
+        return title.trim();
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // No useful name found
+    return null;
+  }
+
+  // Function to extract Facebook links from the correct dialog
+  function getFacebookLinks() {
+    // Find all <div> elements with role="dialog"
+    const dialogDivs = document.querySelectorAll('div[role="dialog"]');
+
+    for (const dialog of dialogDivs) {
+      const links = dialog.querySelectorAll('a[href*="facebook.com"]');
+      if (links.length > 0) {
+        const linksArray = Array.from(links).map(a => ({
+          raw: a.href,
+          link: normalizeFacebookHref(a.href)
+        }));
+
+        // Deduplicate by normalized link
+        const uniqueLinks = [];
+        const seenLinks = new Set();
+        for (const item of linksArray) {
+          if (!seenLinks.has(item.link)) {
+            uniqueLinks.push(item);
+            seenLinks.add(item.link);
+          }
+        }
+
+        return uniqueLinks;
+      }
+    }
+
+    return [];
+  }
+
+  // Function to scroll and load content while capturing Facebook links
+  function autoScrollAndCapture(element) {
+    const interval = setInterval(() => {
+      if (userRequestedStop) {
+        clearInterval(interval);
+        console.log('User signaled to stop.');
+        console.log('Processing to csv... Please wait...');
+        populateNamesAndGenerateCSV(facebookLinks);
+        return;
+      }
+
+      // Scroll down by a small amount (tweak if needed)
+      element.scrollBy(0, 1000);
+
+      // Extract current Facebook links from the dialog(s)
+      const currentFacebookLinks = getFacebookLinks();
+
+      // Merge the new links into the main list and remove duplicates by normalized link
+      const mergedMap = new Map(facebookLinks.map(i => [i.link, i]));
+      for (const item of currentFacebookLinks) {
+        if (!mergedMap.has(item.link)) {
+          mergedMap.set(item.link, item);
+        } else {
+          // Optionally update raw if new/raw differs and is longer
+          const existing = mergedMap.get(item.link);
+          if (!existing.raw && item.raw) existing.raw = item.raw;
+        }
+      }
+      facebookLinks = Array.from(mergedMap.values());
+
+      console.log(`Captured Facebook links: ${facebookLinks.length}`);
+    }, 300);
+  }
+
+  // Function to populate names by searching the page for `<a>` tags with the normalized link in their href
+  function populateNamesAndGenerateCSV(data) {
+    data.forEach(item => {
+      // Look for anchors where href contains the normalized link (or the raw href as fallback)
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      const candidates = anchors.filter(a => {
+        try {
+          const candidateHrefNorm = normalizeFacebookHref(a.href);
+          return candidateHrefNorm === item.link || a.href.includes(item.link) || (item.raw && a.href.includes(item.raw));
+        } catch (e) {
+          return false;
+        }
+      });
+
+      // Use the improved extractor to avoid picking "profile picture" or img alt text.
+      let foundName = null;
+      for (const a of candidates) {
+        const name = extractNameFromAnchor(a);
+        if (name) {
+          foundName = name;
+          break;
+        }
+      }
+
+      item.name = foundName || "Unnamed";
+    });
+
+    generateCSV(data);
+  }
+
+  // Function to generate CSV and output it
+  function generateCSV(data) {
+    let csvContent = "Name,Link\r\n";
+    data.forEach(item => {
+      // Escape double quotes in name and link
+      const nameEsc = String(item.name).replace(/"/g, '""');
+      const linkEsc = String(item.link).replace(/"/g, '""');
+      csvContent += `"${nameEsc}","${linkEsc}"\r\n`;
+    });
+
+    // Trigger download
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const dlLink = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+    dlLink.setAttribute("href", url);
+    dlLink.setAttribute("download", "facebook_links.csv");
+    dlLink.style.visibility = "hidden";
+    document.body.appendChild(dlLink);
+    dlLink.click();
+    document.body.removeChild(dlLink);
+    URL.revokeObjectURL(url);
+
+    console.log("CSV file generated and downloaded.");
+  }
+
+  // Start auto-scrolling and capturing Facebook links
+  autoScrollAndCapture(lastScrollableElement);
+
+  // Helpful console messages
+  console.log("Started auto-scrolling. To stop and export CSV run: window.postMessage('stop', '*');");
+})();
