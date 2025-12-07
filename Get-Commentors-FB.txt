@@ -5,6 +5,11 @@
   // it aggregates results by commenter (Name+Profile Link) and produces a CSV
   // with columns: Name, Link, Comments Count, Tags Count
   // Rows with Comments Count === 0 are skipped.
+  //
+  // Selection change: choose the FIRST scrollable element that:
+  //  - has a non-zero rendered height (getBoundingClientRect().height !== 0)
+  //  - is inside a dialog (has an ancestor matching div[role="dialog"])
+  // If none found, fall back to the original last scrollable element behavior.
 
   // --- helpers (normalize + name extraction + posts-check) ---
   function normalizeFacebookHref(href) {
@@ -109,14 +114,46 @@
 
   // find scrollable element
   function isScrollable(element) {
-    const style = window.getComputedStyle(element);
-    const overflowY = style.overflowY;
-    const overflowX = style.overflowX;
-    const isOverflowScrollable = (overflowY === 'scroll' || overflowY === 'auto') ||
-                                 (overflowX === 'scroll' || overflowX === 'auto');
+    try {
+      const style = window.getComputedStyle(element);
+      const overflowY = style.overflowY;
+      const overflowX = style.overflowX;
+      const isOverflowScrollable = (overflowY === 'scroll' || overflowY === 'auto') ||
+                                   (overflowX === 'scroll' || overflowX === 'auto');
 
-    return isOverflowScrollable &&
-           (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth);
+      return isOverflowScrollable &&
+             (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function getCssPath(el) {
+    if (!el || el.nodeType !== 1) return '';
+    const parts = [];
+    while (el && el.nodeType === 1 && el.tagName.toLowerCase() !== 'html') {
+      let part = el.tagName.toLowerCase();
+      if (el.id) {
+        part += `#${el.id}`;
+        parts.unshift(part);
+        break;
+      }
+      if (el.classList && el.classList.length) {
+        const classes = Array.from(el.classList).slice(0, 3).map(c => c.replace(/\s+/g, ''));
+        if (classes.length) part += '.' + classes.join('.');
+      }
+      const parent = el.parentElement;
+      if (parent) {
+        const siblingsOfSameTag = Array.from(parent.children).filter(ch => ch.tagName === el.tagName);
+        if (siblingsOfSameTag.length > 1) {
+          const idx = Array.prototype.indexOf.call(parent.children, el) + 1;
+          part += `:nth-child(${idx})`;
+        }
+      }
+      parts.unshift(part);
+      el = el.parentElement;
+    }
+    return parts.join(' > ');
   }
 
   const allElements = document.querySelectorAll('*');
@@ -128,6 +165,44 @@
   }
 
   const lastScrollableElement = scrollableElements[scrollableElements.length - 1];
+
+  // NEW selection: pick the FIRST scrollable element that:
+  //  - has non-zero bounding rect height
+  //  - is inside a dialog (closest ancestor div[role="dialog"])
+  let preferredScrollable = null;
+  for (const el of scrollableElements) {
+    try {
+      const rect = el.getBoundingClientRect();
+      const hasHeight = rect && Math.round(rect.height) !== 0;
+      const inDialog = !!(el.closest && el.closest('div[role="dialog"]'));
+      if (hasHeight && inDialog) {
+        preferredScrollable = el;
+        break;
+      }
+    } catch (e) {
+      // ignore and continue
+    }
+  }
+
+  const scrollTarget = preferredScrollable || lastScrollableElement;
+
+  if (preferredScrollable) {
+    try {
+      console.log('Selected scroll target (first scrollable inside dialog with non-zero height):', getCssPath(preferredScrollable));
+      const r = preferredScrollable.getBoundingClientRect();
+      console.log('Bounding rect:', { top: Math.round(r.top), left: Math.round(r.left), width: Math.round(r.width), height: Math.round(r.height) });
+    } catch (e) {
+      console.log('Selected preferred scrollable element (inside dialog).');
+    }
+  } else {
+    try {
+      console.warn('No preferred scrollable element inside a dialog found. Falling back to last scrollable element: ', getCssPath(lastScrollableElement));
+      const r = lastScrollableElement.getBoundingClientRect();
+      console.log('Bounding rect:', { top: Math.round(r.top), left: Math.round(r.left), width: Math.round(r.width), height: Math.round(r.height) });
+    } catch (e) {
+      console.warn('Falling back to last scrollable element.');
+    }
+  }
 
   // dialog + articles scoping and per-article extraction
   function findScopedArticles() {
@@ -243,6 +318,11 @@
   });
 
   function autoScrollAndCapture(element) {
+    if (!element) {
+      console.error('No element provided to autoScrollAndCapture.');
+      return;
+    }
+
     const interval = setInterval(() => {
       if (userRequestedStop) {
         clearInterval(interval);
@@ -379,6 +459,6 @@
   }
 
   // start
-  autoScrollAndCapture(lastScrollableElement);
-  console.log("Started auto-scrolling. To stop and produce CSV run: window.postMessage('stop', '*');");
+  autoScrollAndCapture(scrollTarget);
+  console.log("Started auto-scrolling on the selected element. To stop and produce CSV run: window.postMessage('stop', '*');");
 })();
