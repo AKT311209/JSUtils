@@ -475,7 +475,7 @@
     const dlLink = document.createElement("a");
     const url = URL.createObjectURL(blob);
     dlLink.setAttribute("href", url);
-    dlLink.setAttribute("download", "facebook_links.csv");
+    dlLink.setAttribute("download", "react.csv");
     dlLink.style.visibility = "hidden";
     document.body.appendChild(dlLink);
     dlLink.click();
