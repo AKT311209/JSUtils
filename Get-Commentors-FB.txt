@@ -564,7 +564,7 @@
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'facebook_commenters_aggregation.csv';
+      a.download = 'comment.csv';
       document.body.appendChild(a);
       a.click();
       setTimeout(() => {
