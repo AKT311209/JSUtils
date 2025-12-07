@@ -1,15 +1,18 @@
 (function () {
   // This script is an enhanced version of your extractor.
   // It auto-scrolls, captures per-article facebook links (first + tags),
-  // and when you signal stop with: window.postMessage('stop', '*');
-  // it aggregates results by commenter (Name+Profile Link) and produces a CSV
-  // with columns: Name, Link, Comments Count, Tags Count
+  // and when you signal stop it aggregates results by commenter (Name+Profile Link)
+  // and produces a CSV with columns: Name, Link, Comments Count, Tags Count
   // Rows with Comments Count === 0 are skipped.
   //
   // Selection change: choose the FIRST scrollable element that:
   //  - has a non-zero rendered height (getBoundingClientRect().height !== 0)
   //  - is inside a dialog (has an ancestor matching div[role="dialog"])
   // If none found, fall back to the original last scrollable element behavior.
+  //
+  // Updated: You can now stop the auto-scroll and trigger CSV generation by
+  // typing the word "stop" into the on-page input box and pressing Enter.
+  // (window.postMessage('stop','*') still works for compatibility.)
 
   // --- helpers (normalize + name extraction + posts-check) ---
   function normalizeFacebookHref(href) {
@@ -311,17 +314,134 @@
   let facebookLinks = [];
   let userRequestedStop = false;
 
+  // Keep supporting window.postMessage('stop','*') for compatibility
   window.addEventListener('message', (event) => {
     if (event.data === 'stop') {
       userRequestedStop = true;
     }
   });
 
+  // Create an on-page input so the user can type "stop" and press Enter
+  function createStopInputOverlay() {
+    try {
+      // Prevent creating multiple overlays from the same run
+      if (document.querySelector('.fb-extractor-stop-overlay')) return;
+
+      // Use a run-unique ID so old observers from prior runs (if any) won't match/remove this overlay
+      const overlayId = 'fb-extractor-stop-overlay-' + Math.random().toString(36).slice(2, 9);
+
+      const wrapper = document.createElement('div');
+      wrapper.className = 'fb-extractor-stop-overlay';
+      wrapper.id = overlayId;
+      wrapper.style.position = 'fixed';
+      wrapper.style.right = '12px';
+      wrapper.style.top = '12px';
+      wrapper.style.zIndex = 2147483647; // very high
+      wrapper.style.background = 'rgba(0,0,0,0.7)';
+      wrapper.style.color = '#fff';
+      wrapper.style.padding = '8px';
+      wrapper.style.borderRadius = '6px';
+      wrapper.style.fontFamily = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial';
+      wrapper.style.fontSize = '12px';
+      wrapper.style.boxShadow = '0 2px 10px rgba(0,0,0,0.5)';
+      wrapper.style.display = 'flex';
+      wrapper.style.alignItems = 'center';
+      wrapper.style.gap = '8px';
+      wrapper.style.maxWidth = '320px';
+
+      const label = document.createElement('span');
+      label.textContent = 'Type "stop" and press Enter';
+      label.style.whiteSpace = 'nowrap';
+
+      const form = document.createElement('form');
+      form.style.display = 'flex';
+      form.style.gap = '6px';
+      form.style.alignItems = 'center';
+
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.placeholder = 'stop';
+      input.style.padding = '6px 8px';
+      input.style.borderRadius = '4px';
+      input.style.border = '1px solid rgba(255,255,255,0.15)';
+      input.style.background = 'rgba(255,255,255,0.05)';
+      input.style.color = '#fff';
+      input.style.outline = 'none';
+      input.style.width = '110px';
+
+      const btn = document.createElement('button');
+      btn.type = 'submit';
+      btn.textContent = 'OK';
+      btn.style.padding = '6px 8px';
+      btn.style.border = 'none';
+      btn.style.borderRadius = '4px';
+      btn.style.background = '#2d88ff';
+      btn.style.color = '#fff';
+      btn.style.cursor = 'pointer';
+
+      form.appendChild(input);
+      form.appendChild(btn);
+      wrapper.appendChild(label);
+      wrapper.appendChild(form);
+      document.body.appendChild(wrapper);
+
+      // Focus the input so user can immediately type
+      input.focus();
+
+      let obs = null;
+
+      function removeOverlay() {
+        try {
+          const el = document.getElementById(overlayId);
+          if (el) el.remove();
+        } catch (e) {}
+        try {
+          if (obs) obs.disconnect();
+        } catch (e) {}
+      }
+
+      form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const val = (input.value || '').trim().toLowerCase();
+        if (val === 'stop') {
+          userRequestedStop = true;
+          removeOverlay();
+          console.log('Stop command received via overlay input.');
+        } else {
+          // small feedback: clear and briefly flash
+          input.value = '';
+          input.style.transition = 'box-shadow 0.15s';
+          input.style.boxShadow = '0 0 0 3px rgba(255,0,0,0.15)';
+          setTimeout(() => {
+            input.style.boxShadow = '';
+          }, 250);
+        }
+      });
+
+      // allow clicking the label to focus
+      label.addEventListener('click', () => input.focus());
+
+      // remove overlay on stop via other means; observer belongs to this run and will be disconnected in removeOverlay
+      obs = new MutationObserver(() => {
+        if (userRequestedStop) {
+          removeOverlay();
+        }
+      });
+      obs.observe(document.documentElement || document.body, { childList: true, subtree: true });
+
+    } catch (e) {
+      console.warn('Could not create stop overlay input:', e);
+    }
+  }
+
   function autoScrollAndCapture(element) {
     if (!element) {
       console.error('No element provided to autoScrollAndCapture.');
       return;
     }
+
+    // create the overlay to allow typing "stop"
+    createStopInputOverlay();
 
     const interval = setInterval(() => {
       if (userRequestedStop) {
@@ -460,5 +580,6 @@
 
   // start
   autoScrollAndCapture(scrollTarget);
-  console.log("Started auto-scrolling on the selected element. To stop and produce CSV run: window.postMessage('stop', '*');");
+  console.log('Started auto-scrolling on the selected element.');
+  console.log('To stop and produce CSV: type "stop" into the on-page box and press Enter (or run: window.postMessage(\'stop\', \'*\') ).');
 })();
